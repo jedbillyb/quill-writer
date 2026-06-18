@@ -46,14 +46,31 @@ def _ext_dir():
 def _resolve_sidecar(ctx):
     """Return (python_path, script_path, env) for launching the sidecar.
 
-    The bundled venv interpreter is preferred; CLAUDE_WRITER_PYTHON overrides it.
+    The installed extension (in LibreOffice's cache) does not contain the sidecar
+    venv, so look for a Python 3.10+ with claude-agent-sdk in these places, in
+    order: $CLAUDE_WRITER_PYTHON, ~/.config/claude-writer/python (a file holding
+    the path), the extension's own .venv, then the documented source-tree venv.
     """
     ext = _ext_dir()
-    venv_py = os.path.join(ext, ".venv", "bin", "python")
-    python_path = os.environ.get("CLAUDE_WRITER_PYTHON") or (
-        venv_py if os.path.exists(venv_py) else "python3"
-    )
     script = os.path.join(ext, "sidecar", "agent_main.py")
+
+    candidates = []
+    if os.environ.get("CLAUDE_WRITER_PYTHON"):
+        candidates.append(os.environ["CLAUDE_WRITER_PYTHON"])
+    cfg = os.path.expanduser("~/.config/claude-writer/python")
+    if os.path.exists(cfg):
+        try:
+            with open(cfg) as fh:
+                candidates.append(fh.read().strip())
+        except OSError:
+            pass
+    candidates += [
+        os.path.join(ext, ".venv", "bin", "python"),
+        os.path.expanduser("~/claude-writer/.venv/bin/python"),
+        os.path.expanduser("~/.claude-writer/.venv/bin/python"),
+    ]
+    python_path = next((p for p in candidates if p and os.path.exists(p)), "python3")
+
     env = dict(os.environ)
     env.pop("ANTHROPIC_API_KEY", None)  # force Claude Code subscription auth
     return python_path, script, env
@@ -66,8 +83,10 @@ class _MainThreadCaller(unohelper.Base, XCallback):
     """Runs a queued Python callable on the LibreOffice main thread."""
 
     def __init__(self, ctx):
-        self._async = ctx.getValueByName(
-            "/singletons/com.sun.star.awt.theAsyncCallback"
+        # The /singletons/...theAsyncCallback path resolves to None in an
+        # extension context; create the service explicitly instead.
+        self._async = ctx.getServiceManager().createInstanceWithContext(
+            "com.sun.star.awt.AsyncCallback", ctx
         )
         self._lock = threading.Lock()
         self._queue = []
@@ -75,7 +94,10 @@ class _MainThreadCaller(unohelper.Base, XCallback):
     def post(self, func):
         with self._lock:
             self._queue.append(func)
-        self._async.addCallback(self, None)
+        if self._async is not None:
+            self._async.addCallback(self, None)
+        else:  # degraded fallback: run inline (not main-thread, last resort)
+            self.notify(None)
 
     def notify(self, _data):
         with self._lock:

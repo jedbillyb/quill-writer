@@ -1,0 +1,11 @@
+Claude Assistant for LibreOffice Writer.
+
+Adds a "Claude" sidebar panel that lets you chat with Claude, rewrite the
+selected text, generate or continue writing, and summarise the document.
+Every edit is previewed for Apply/Reject before it changes your document.
+
+Authentication uses your existing Claude Code login (subscription) via the
+Claude Agent SDK — no Anthropic API key is required.
+
+Prerequisites: the Claude Code CLI installed and logged in, and the bundled
+sidecar Python environment (see README).

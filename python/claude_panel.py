@@ -1,0 +1,357 @@
+"""LibreOffice Writer sidebar panel for Claude.
+
+Implements the UNO sidebar factory (``com.sun.star.ui.XUIElementFactory``) and a
+native AWT panel: a chat log, an input box, Send, and Apply/Reject buttons that
+appear when Claude proposes an edit (preview-then-apply).
+
+The heavy lifting lives in the tested backbone modules:
+  * sidecar_client.SidecarClient  — runs the Claude agent sidecar
+  * writer_ops                    — UNO document read/edit operations
+
+Sidecar callbacks arrive on a background thread; everything that touches UNO or
+the UI is marshalled onto the LibreOffice main thread via theAsyncCallback.
+"""
+
+import os
+import sys
+import threading
+import traceback
+
+# LibreOffice loads this component module without its own directory on sys.path,
+# so make sibling modules (sidecar_client, writer_ops) importable.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import uno
+import unohelper
+
+from com.sun.star.ui import (
+    XUIElementFactory, XUIElement, XToolPanel, XSidebarPanel, LayoutSize,
+)
+from com.sun.star.ui.UIElementType import TOOLPANEL as UET_TOOLPANEL
+from com.sun.star.awt import XActionListener, XCallback
+
+import sidecar_client
+import writer_ops
+
+IMPL_NAME = "org.jed.claudewriter.PanelFactory"
+RESOURCE_URL = "private:resource/toolpanel/ClaudeWriterFactory/ClaudePanel"
+
+# ----------------------------------------------------------------------------
+# Configuration (python path for the sidecar venv, optional model override)
+# ----------------------------------------------------------------------------
+def _ext_dir():
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _resolve_sidecar(ctx):
+    """Return (python_path, script_path, env) for launching the sidecar.
+
+    The bundled venv interpreter is preferred; CLAUDE_WRITER_PYTHON overrides it.
+    """
+    ext = _ext_dir()
+    venv_py = os.path.join(ext, ".venv", "bin", "python")
+    python_path = os.environ.get("CLAUDE_WRITER_PYTHON") or (
+        venv_py if os.path.exists(venv_py) else "python3"
+    )
+    script = os.path.join(ext, "sidecar", "agent_main.py")
+    env = dict(os.environ)
+    env.pop("ANTHROPIC_API_KEY", None)  # force Claude Code subscription auth
+    return python_path, script, env
+
+
+# ----------------------------------------------------------------------------
+# Main-thread marshalling
+# ----------------------------------------------------------------------------
+class _MainThreadCaller(unohelper.Base, XCallback):
+    """Runs a queued Python callable on the LibreOffice main thread."""
+
+    def __init__(self, ctx):
+        self._async = ctx.getValueByName(
+            "/singletons/com.sun.star.awt.theAsyncCallback"
+        )
+        self._lock = threading.Lock()
+        self._queue = []
+
+    def post(self, func):
+        with self._lock:
+            self._queue.append(func)
+        self._async.addCallback(self, None)
+
+    def notify(self, _data):
+        with self._lock:
+            func = self._queue.pop(0) if self._queue else None
+        if func is not None:
+            try:
+                func()
+            except Exception:
+                traceback.print_exc()
+
+
+# ----------------------------------------------------------------------------
+# Panel
+# ----------------------------------------------------------------------------
+class ClaudePanel(unohelper.Base, XActionListener):
+    def __init__(self, ctx, parent_window):
+        self.ctx = ctx
+        self.smgr = ctx.getServiceManager()
+        self.parent = parent_window
+        self.main = _MainThreadCaller(ctx)
+        self.pending_edit = None  # (done_callback, op, args)
+        self.container = None
+        self._controls = {}
+        self._build_ui()
+        self._start_sidecar()
+
+    # -- UI construction ---------------------------------------------------
+    def _create(self, service):
+        return self.smgr.createInstanceWithContext(service, self.ctx)
+
+    def _build_ui(self):
+        toolkit = self._create("com.sun.star.awt.Toolkit")
+
+        model = self._create("com.sun.star.awt.UnoControlContainerModel")
+        container = self._create("com.sun.star.awt.UnoControlContainer")
+        container.setModel(model)
+        container.createPeer(toolkit, self.parent)
+        self.container = container
+
+        self._controls["log"] = self._add_edit(model, container, "log",
+                                                multiline=True, readonly=True)
+        self._controls["preview"] = self._add_edit(model, container, "preview",
+                                                    multiline=True, readonly=True)
+        self._controls["input"] = self._add_edit(model, container, "input",
+                                                  multiline=True, readonly=False)
+        self._controls["send"] = self._add_button(model, container, "send", "Send")
+        self._controls["apply"] = self._add_button(model, container, "apply", "Apply")
+        self._controls["reject"] = self._add_button(model, container, "reject", "Reject")
+        self._controls["status"] = self._add_label(model, container, "status",
+                                                    "Starting Claude…")
+
+        self._show_preview(False)
+        self._relayout()
+
+    def _add_edit(self, cmodel, container, name, multiline, readonly):
+        m = cmodel.createInstance("com.sun.star.awt.UnoControlEditModel")
+        m.setPropertyValue("MultiLine", multiline)
+        m.setPropertyValue("ReadOnly", readonly)
+        m.setPropertyValue("VScroll", multiline)
+        m.setPropertyValue("AutoVScroll", multiline)
+        cmodel.insertByName(name, m)
+        return container.getControl(name)
+
+    def _add_button(self, cmodel, container, name, label):
+        m = cmodel.createInstance("com.sun.star.awt.UnoControlButtonModel")
+        m.setPropertyValue("Label", label)
+        cmodel.insertByName(name, m)
+        ctl = container.getControl(name)
+        ctl.setActionCommand(name)
+        ctl.addActionListener(self)
+        return ctl
+
+    def _add_label(self, cmodel, container, name, text):
+        m = cmodel.createInstance("com.sun.star.awt.UnoControlFixedTextModel")
+        m.setPropertyValue("Label", text)
+        cmodel.insertByName(name, m)
+        return container.getControl(name)
+
+    def _relayout(self):
+        size = self.parent.getPosSize()
+        w, h = size.Width, size.Height
+        pad = 6
+        x = pad
+        cw = max(40, w - 2 * pad)
+        status_h = 18
+        btn_h = 26
+        input_h = 60
+        preview_visible = self.pending_edit is not None
+        preview_h = 90 if preview_visible else 0
+
+        y = pad
+        self._controls["status"].setPosSize(x, y, cw, status_h, 15)
+        y += status_h + pad
+        log_h = max(60, h - (status_h + preview_h + input_h + btn_h + 6 * pad))
+        self._controls["log"].setPosSize(x, y, cw, log_h, 15)
+        y += log_h + pad
+        if preview_visible:
+            self._controls["preview"].setPosSize(x, y, cw, preview_h, 15)
+            y += preview_h + pad
+        self._controls["input"].setPosSize(x, y, cw, input_h, 15)
+        y += input_h + pad
+        bw = (cw - 2 * pad) // 3
+        self._controls["send"].setPosSize(x, y, bw, btn_h, 15)
+        self._controls["apply"].setPosSize(x + bw + pad, y, bw, btn_h, 15)
+        self._controls["reject"].setPosSize(x + 2 * (bw + pad), y, bw, btn_h, 15)
+
+    def _show_preview(self, visible):
+        for n in ("preview", "apply", "reject"):
+            self._controls[n].setVisible(visible)
+
+    # -- sidecar -----------------------------------------------------------
+    def _start_sidecar(self):
+        python_path, script, env = _resolve_sidecar(self.ctx)
+        self.client = sidecar_client.SidecarClient(
+            python_path, script, env=env, cwd=_ext_dir(),
+            on_ready=lambda: self.main.post(self._on_ready),
+            on_assistant=lambda t: self.main.post(lambda: self._append_log("Claude", t)),
+            on_turn_done=lambda: self.main.post(lambda: self._set_status("Ready")),
+            on_error=lambda m: self.main.post(lambda: self._on_error(m)),
+            read_op=self._read_op,            # runs on reader thread; UNO read is tolerant
+            request_edit=self._request_edit,  # marshalled to main thread below
+        )
+        try:
+            self.client.start()
+        except Exception as exc:
+            self._set_status(f"Could not start Claude: {exc}")
+
+    def _on_ready(self):
+        self._set_status("Ready")
+
+    def _on_error(self, msg):
+        self._set_status("Error")
+        self._append_log("System", msg)
+
+    # document ops (read ops kept simple; edits marshalled & user-gated)
+    def _read_op(self, op, args):
+        doc = writer_ops.current_text_doc(self.ctx)
+        if op == "get_document_text":
+            return {"text": writer_ops.get_document_text(doc)}
+        if op == "get_selection":
+            return {"text": writer_ops.get_selection(doc)}
+        return {}
+
+    def _request_edit(self, op, args, done):
+        # Called on the reader thread -> hop to the main thread to show preview.
+        def show():
+            self.pending_edit = (done, op, args)
+            label = "replace selection" if op == "replace_selection" else "insert"
+            self._controls["preview"].setText(args.get("text", ""))
+            self._set_status(f"Claude proposes to {label}. Apply or Reject?")
+            self._show_preview(True)
+            self._relayout()
+        self.main.post(show)
+
+    # -- UI events ---------------------------------------------------------
+    def actionPerformed(self, ev):
+        cmd = ev.ActionCommand
+        if cmd == "send":
+            self._do_send()
+        elif cmd == "apply":
+            self._resolve_edit(True)
+        elif cmd == "reject":
+            self._resolve_edit(False)
+
+    def _do_send(self):
+        text = self._controls["input"].getText().strip()
+        if not text or not self.client.is_running():
+            return
+        self._controls["input"].setText("")
+        self._append_log("You", text)
+        self._set_status("Claude is working…")
+        self.client.send_user(text)
+
+    def _resolve_edit(self, apply_it):
+        if self.pending_edit is None:
+            return
+        done, op, args = self.pending_edit
+        self.pending_edit = None
+        self._show_preview(False)
+        self._relayout()
+        if apply_it:
+            try:
+                doc = writer_ops.current_text_doc(self.ctx)
+                if op == "replace_selection":
+                    writer_ops.apply_replace_selection(doc, args.get("text", ""))
+                elif op == "insert_at_cursor":
+                    writer_ops.apply_insert_at_cursor(doc, args.get("text", ""))
+                done(True)
+                self._set_status("Edit applied")
+            except Exception as exc:
+                done(False, error=str(exc))
+                self._set_status(f"Edit failed: {exc}")
+        else:
+            done(False)
+            self._set_status("Edit rejected")
+
+    # -- helpers -----------------------------------------------------------
+    def _append_log(self, who, text):
+        log = self._controls["log"]
+        existing = log.getText()
+        sep = "\n\n" if existing else ""
+        log.setText(f"{existing}{sep}{who}: {text}")
+
+    def _set_status(self, text):
+        self._controls["status"].setText(text)
+
+    def disposing(self, _ev):
+        pass
+
+    def dispose(self):
+        try:
+            self.client.stop()
+        except Exception:
+            pass
+
+    def get_window(self):
+        return self.container
+
+
+# ----------------------------------------------------------------------------
+# UI element wrappers
+# ----------------------------------------------------------------------------
+class PanelUIElement(unohelper.Base, XUIElement, XToolPanel, XSidebarPanel):
+    def __init__(self, ctx, frame, panel):
+        self.ctx = ctx
+        self._frame = frame
+        self._panel = panel
+
+    # XUIElement
+    def getFrame(self):
+        return self._frame
+
+    def getResourceURL(self):
+        return RESOURCE_URL
+
+    def getType(self):
+        return UET_TOOLPANEL
+
+    def getRealInterface(self):
+        return self  # also implements XToolPanel
+
+    # XToolPanel
+    def createAccessible(self, _parent):
+        return self._panel.get_window().getAccessibleContext()
+
+    def getWindow(self):
+        return self._panel.get_window()
+
+    # XSidebarPanel
+    def getHeightForWidth(self, _width):
+        return LayoutSize(0, -1, 0)  # flexible height
+
+    def getMinimalWidth(self):
+        return 180
+
+
+class PanelFactory(unohelper.Base, XUIElementFactory):
+    def __init__(self, ctx):
+        self.ctx = ctx
+
+    def createUIElement(self, resource_url, args):
+        frame = None
+        parent = None
+        for arg in args:
+            if arg.Name == "Frame":
+                frame = arg.Value
+            elif arg.Name == "ParentWindow":
+                parent = arg.Value
+        panel = ClaudePanel(self.ctx, parent)
+        return PanelUIElement(self.ctx, frame, panel)
+
+
+# ----------------------------------------------------------------------------
+# Registration
+# ----------------------------------------------------------------------------
+g_ImplementationHelper = unohelper.ImplementationHelper()
+g_ImplementationHelper.addImplementation(
+    PanelFactory, IMPL_NAME, ("com.sun.star.ui.UIElementFactory",)
+)

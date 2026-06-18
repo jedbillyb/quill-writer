@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<description xmlns="http://openoffice.org/extensions/description/2006"
+             xmlns:d="http://openoffice.org/extensions/description/2006"
+             xmlns:xlink="http://www.w3.org/1999/xlink">
+  <identifier value="org.jed.claudewriter"/>
+  <version value="0.1.0"/>
+  <display-name>
+    <name lang="en">Claude Assistant for Writer</name>
+  </display-name>
+  <publisher>
+    <name xlink:href="https://github.com/" lang="en">Jed Blenkhorn</name>
+  </publisher>
+  <extension-description>
+    <src lang="en" xlink:href="description-en.txt"/>
+  </extension-description>
+  <dependencies>
+    <!-- Sidebar API and Python scripting; LibreOffice 6.0+ -->
+    <d:OpenOffice.org-minimal-version d:name="LibreOffice 6.0" value="4.1"/>
+  </dependencies>
+</description>

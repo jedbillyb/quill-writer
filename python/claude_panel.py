@@ -28,7 +28,7 @@ from com.sun.star.ui import (
     XUIElementFactory, XUIElement, XToolPanel, XSidebarPanel, LayoutSize,
 )
 from com.sun.star.ui.UIElementType import TOOLPANEL as UET_TOOLPANEL
-from com.sun.star.awt import XActionListener, XCallback
+from com.sun.star.awt import XActionListener, XCallback, XWindowListener
 
 import sidecar_client
 import writer_ops
@@ -99,64 +99,101 @@ class ClaudePanel(unohelper.Base, XActionListener):
         self.pending_edit = None  # (done_callback, op, args)
         self.container = None
         self._controls = {}
-        self._build_ui()
-        self._start_sidecar()
+        self._resize_listener = None
+        try:
+            self._build_ui()
+        except Exception:
+            self._build_error_ui(traceback.format_exc())
+            return
+        try:
+            self._start_sidecar()
+        except Exception as exc:
+            self._set_status(f"Could not start Claude: {exc}")
 
     # -- UI construction ---------------------------------------------------
     def _create(self, service):
         return self.smgr.createInstanceWithContext(service, self.ctx)
 
     def _build_ui(self):
-        toolkit = self._create("com.sun.star.awt.Toolkit")
-
-        model = self._create("com.sun.star.awt.UnoControlContainerModel")
+        self._toolkit = self._create("com.sun.star.awt.Toolkit")
         container = self._create("com.sun.star.awt.UnoControlContainer")
-        container.setModel(model)
-        container.createPeer(toolkit, self.parent)
+        container.setModel(self._create("com.sun.star.awt.UnoControlContainerModel"))
+        container.createPeer(self._toolkit, self.parent)
         self.container = container
 
-        self._controls["log"] = self._add_edit(model, container, "log",
-                                                multiline=True, readonly=True)
-        self._controls["preview"] = self._add_edit(model, container, "preview",
-                                                    multiline=True, readonly=True)
-        self._controls["input"] = self._add_edit(model, container, "input",
-                                                  multiline=True, readonly=False)
-        self._controls["send"] = self._add_button(model, container, "send", "Send")
-        self._controls["apply"] = self._add_button(model, container, "apply", "Apply")
-        self._controls["reject"] = self._add_button(model, container, "reject", "Reject")
-        self._controls["status"] = self._add_label(model, container, "status",
-                                                    "Starting Claude…")
+        self._controls["log"] = self._add_edit("log", multiline=True, readonly=True)
+        self._controls["preview"] = self._add_edit("preview", multiline=True, readonly=True)
+        self._controls["input"] = self._add_edit("input", multiline=True, readonly=False)
+        self._controls["send"] = self._add_button("send", "Send")
+        self._controls["apply"] = self._add_button("apply", "Apply")
+        self._controls["reject"] = self._add_button("reject", "Reject")
+        self._controls["status"] = self._add_label("status", "Starting Claude…")
 
+        # Fill the parent, become visible, and re-lay-out whenever resized.
+        psz = self.parent.getPosSize()
+        container.setPosSize(0, 0, psz.Width, psz.Height, 15)
+        self._resize_listener = _ResizeListener(self)
+        self.parent.addWindowListener(self._resize_listener)
         self._show_preview(False)
         self._relayout()
+        container.setVisible(True)
 
-    def _add_edit(self, cmodel, container, name, multiline, readonly):
-        m = cmodel.createInstance("com.sun.star.awt.UnoControlEditModel")
-        m.setPropertyValue("MultiLine", multiline)
-        m.setPropertyValue("ReadOnly", readonly)
-        m.setPropertyValue("VScroll", multiline)
-        m.setPropertyValue("AutoVScroll", multiline)
-        cmodel.insertByName(name, m)
-        return container.getControl(name)
+    def _build_error_ui(self, message):
+        """Last-resort UI so build failures show text instead of a blank panel."""
+        try:
+            self._toolkit = self._create("com.sun.star.awt.Toolkit")
+            container = self._create("com.sun.star.awt.UnoControlContainer")
+            container.setModel(self._create("com.sun.star.awt.UnoControlContainerModel"))
+            container.createPeer(self._toolkit, self.parent)
+            self.container = container
+            err = self._add_edit("err", multiline=True, readonly=True)
+            err.getModel().setPropertyValue("Text",
+                                            "Claude panel failed to load:\n\n" + message)
+            psz = self.parent.getPosSize()
+            container.setPosSize(0, 0, psz.Width, psz.Height, 15)
+            err.setPosSize(4, 4, max(40, psz.Width - 8), max(40, psz.Height - 8), 15)
+            container.setVisible(True)
+        except Exception:
+            traceback.print_exc()
 
-    def _add_button(self, cmodel, container, name, label):
-        m = cmodel.createInstance("com.sun.star.awt.UnoControlButtonModel")
-        m.setPropertyValue("Label", label)
-        cmodel.insertByName(name, m)
-        ctl = container.getControl(name)
+    def _add_control(self, name, ctrl_service, model_service, props):
+        model = self._create(model_service)
+        for key, value in props.items():
+            model.setPropertyValue(key, value)
+        ctl = self._create(ctrl_service)
+        ctl.setModel(model)
+        self.container.addControl(name, ctl)
+        ctl.createPeer(self._toolkit, self.container.getPeer())
+        return ctl
+
+    def _add_edit(self, name, multiline, readonly):
+        return self._add_control(
+            name, "com.sun.star.awt.UnoControlEdit",
+            "com.sun.star.awt.UnoControlEditModel",
+            {"MultiLine": multiline, "ReadOnly": readonly,
+             "VScroll": multiline, "AutoVScroll": multiline})
+
+    def _add_button(self, name, label):
+        ctl = self._add_control(
+            name, "com.sun.star.awt.UnoControlButton",
+            "com.sun.star.awt.UnoControlButtonModel", {"Label": label})
         ctl.setActionCommand(name)
         ctl.addActionListener(self)
         return ctl
 
-    def _add_label(self, cmodel, container, name, text):
-        m = cmodel.createInstance("com.sun.star.awt.UnoControlFixedTextModel")
-        m.setPropertyValue("Label", text)
-        cmodel.insertByName(name, m)
-        return container.getControl(name)
+    def _add_label(self, name, text):
+        return self._add_control(
+            name, "com.sun.star.awt.UnoControlFixedText",
+            "com.sun.star.awt.UnoControlFixedTextModel", {"Label": text})
 
     def _relayout(self):
-        size = self.parent.getPosSize()
+        if self.container is None or "status" not in self._controls:
+            return
+        size = self.container.getPosSize()
         w, h = size.Width, size.Height
+        if w <= 0 or h <= 0:
+            size = self.parent.getPosSize()
+            w, h = size.Width, size.Height
         pad = 6
         x = pad
         cw = max(40, w - 2 * pad)
@@ -293,6 +330,32 @@ class ClaudePanel(unohelper.Base, XActionListener):
 
     def get_window(self):
         return self.container
+
+
+class _ResizeListener(unohelper.Base, XWindowListener):
+    """Keeps the panel container filling the parent and re-lays-out on resize."""
+
+    def __init__(self, panel):
+        self._panel = panel
+
+    def windowResized(self, ev):
+        try:
+            self._panel.container.setPosSize(0, 0, ev.Width, ev.Height, 15)
+            self._panel._relayout()
+        except Exception:
+            traceback.print_exc()
+
+    def windowMoved(self, ev):
+        pass
+
+    def windowShown(self, ev):
+        pass
+
+    def windowHidden(self, ev):
+        pass
+
+    def disposing(self, ev):
+        pass
 
 
 # ----------------------------------------------------------------------------

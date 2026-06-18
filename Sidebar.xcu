@@ -38,6 +38,7 @@
           <value>private:resource/toolpanel/ClaudeWriterFactory/ClaudePanel</value>
         </prop>
         <prop oor:name="OrderIndex" oor:type="xs:int"><value>100</value></prop>
+        <prop oor:name="TitleBarIsOptional" oor:type="xs:boolean"><value>true</value></prop>
       </node>
     </node>
   </node>

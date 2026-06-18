@@ -28,7 +28,11 @@ from com.sun.star.ui import (
     XUIElementFactory, XUIElement, XToolPanel, XSidebarPanel, LayoutSize,
 )
 from com.sun.star.ui.UIElementType import TOOLPANEL as UET_TOOLPANEL
-from com.sun.star.awt import XActionListener, XCallback, XWindowListener
+from com.sun.star.awt import (
+    XActionListener, XCallback, XWindowListener, XKeyListener,
+)
+from com.sun.star.awt.Key import RETURN as KEY_RETURN
+from com.sun.star.awt.KeyModifier import SHIFT as MOD_SHIFT
 
 import sidecar_client
 import writer_ops
@@ -147,9 +151,12 @@ class ClaudePanel(unohelper.Base, XActionListener):
         self._controls["input"] = self._add_edit("input", multiline=True, readonly=False)
         self._controls["send"] = self._add_button("send", "Send")
         self._controls["apply"] = self._add_button("apply", "Apply")
-        self._controls["improve"] = self._add_button("improve", "Improve")
         self._controls["reject"] = self._add_button("reject", "Reject")
         self._controls["status"] = self._add_label("status", "Starting Claude…")
+
+        # Enter sends (Shift+Enter inserts a newline).
+        self._key_listener = _EnterListener(self)
+        self._controls["input"].addKeyListener(self._key_listener)
 
         # Fill the parent, become visible, and re-lay-out whenever resized.
         psz = self.parent.getPosSize()
@@ -232,18 +239,21 @@ class ClaudePanel(unohelper.Base, XActionListener):
         self._controls["log"].setPosSize(x, y, cw, log_h, 15)
         y += log_h + pad
         if actions_visible:
-            bw = (cw - 2 * pad) // 3
+            bw = (cw - pad) // 2
             self._controls["apply"].setPosSize(x, y, bw, btn_h, 15)
-            self._controls["improve"].setPosSize(x + bw + pad, y, bw, btn_h, 15)
-            self._controls["reject"].setPosSize(x + 2 * (bw + pad), y, bw, btn_h, 15)
+            self._controls["reject"].setPosSize(x + bw + pad, y, bw, btn_h, 15)
             y += actions_h
         self._controls["input"].setPosSize(x, y, cw, input_h, 15)
         y += input_h + pad
         self._controls["send"].setPosSize(x, y, cw, btn_h, 15)
 
     def _show_actions(self, visible):
-        for n in ("apply", "improve", "reject"):
+        # While an edit is pending, Apply/Reject appear and the bottom button
+        # becomes "Improve" (sends the input box as revision feedback).
+        for n in ("apply", "reject"):
             self._controls[n].setVisible(visible)
+        self._controls["send"].getModel().setPropertyValue(
+            "Label", "Improve" if visible else "Send")
 
     # -- sidecar -----------------------------------------------------------
     def _start_sidecar(self):
@@ -299,7 +309,7 @@ class ClaudePanel(unohelper.Base, XActionListener):
             self._set_status("Claude wants to "
                              + self._EDIT_LABEL.get(op, "edit")
                              + " (highlighted). Apply, Reject, or type feedback "
-                             + "and click Improve.")
+                             + "and press Improve/Enter.")
             self._show_actions(True)
             self._relayout()
         self.main.post(show)
@@ -308,13 +318,19 @@ class ClaudePanel(unohelper.Base, XActionListener):
     def actionPerformed(self, ev):
         cmd = ev.ActionCommand
         if cmd == "send":
-            self._do_send()
+            self._on_submit()
         elif cmd == "apply":
             self._resolve_edit(True)
         elif cmd == "reject":
             self._resolve_edit(False)
-        elif cmd == "improve":
+
+    def _on_submit(self):
+        # The bottom button / Enter means Improve while an edit is pending,
+        # otherwise a normal chat message.
+        if self.pending_edit is not None:
             self._improve_edit()
+        else:
+            self._do_send()
 
     def _do_send(self):
         text = self._controls["input"].getText().strip()
@@ -391,6 +407,26 @@ class ClaudePanel(unohelper.Base, XActionListener):
 
     def get_window(self):
         return self.container
+
+
+class _EnterListener(unohelper.Base, XKeyListener):
+    """Enter submits (Send or Improve); Shift+Enter inserts a newline."""
+
+    def __init__(self, panel):
+        self._panel = panel
+
+    def keyPressed(self, ev):
+        pass
+
+    def keyReleased(self, ev):
+        if ev.KeyCode == KEY_RETURN and not (ev.Modifiers & MOD_SHIFT):
+            try:
+                self._panel._on_submit()
+            except Exception:
+                traceback.print_exc()
+
+    def disposing(self, ev):
+        pass
 
 
 class _ResizeListener(unohelper.Base, XWindowListener):

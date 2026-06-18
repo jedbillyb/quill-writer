@@ -14,8 +14,8 @@
         <prop oor:name="IconURL" oor:type="xs:string">
           <value>vnd.sun.star.extension://org.jed.claudewriter/icons/claude.png</value>
         </prop>
-        <prop oor:name="ContextList" oor:type="oor:string-list">
-          <value oor:separator=";">Text, any, visible ; WriterGlobal, any, visible</value>
+        <prop oor:name="ContextList">
+          <value oor:separator=";">Writer, any, visible ; WriterVariants, any, visible</value>
         </prop>
         <prop oor:name="OrderIndex" oor:type="xs:int"><value>500</value></prop>
       </node>
@@ -31,8 +31,8 @@
         <prop oor:name="DeckId" oor:type="xs:string">
           <value>ClaudeWriterDeck</value>
         </prop>
-        <prop oor:name="ContextList" oor:type="oor:string-list">
-          <value oor:separator=";">Text, any, visible ; WriterGlobal, any, visible</value>
+        <prop oor:name="ContextList">
+          <value oor:separator=";">Writer, any, visible ; WriterVariants, any, visible</value>
         </prop>
         <prop oor:name="ImplementationURL" oor:type="xs:string">
           <value>private:resource/toolpanel/ClaudeWriterFactory/ClaudePanel</value>
